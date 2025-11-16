@@ -1,16 +1,20 @@
 # GitHub Actions UFW Whitelist
 
-Automatically whitelist GitHub Actions IP ranges in UFW firewall for a specified TCP port.
+Automatically whitelist GitHub Actions IP ranges in UFW firewall for a specified TCP port using **ipset** for efficient management of thousands of IPs.
 
 ## Overview
 
-This script fetches the current GitHub Actions IP ranges from GitHub's public API and automatically configures UFW (Uncomplicated Firewall) rules to allow traffic from these IPs to a specified TCP port. It's designed to run via crontab to keep the whitelist up-to-date as GitHub updates their IP ranges.
+This script fetches the current GitHub Actions IP ranges from GitHub's public API and automatically configures UFW (Uncomplicated Firewall) rules using **ipset** to allow traffic from these IPs to a specified TCP port.
+
+**Why ipset?** GitHub provides 5000+ IP ranges for Actions. Using individual UFW rules would be extremely slow (hours to update). ipset allows managing all IPs efficiently with a single firewall rule, updating in seconds instead of hours.
 
 ## Features
 
+- **High Performance**: Uses ipset to manage 5000+ IPs efficiently (single rule instead of thousands)
 - Fetches GitHub Actions IP ranges from GitHub's official API
-- Automatically adds UFW rules for new IP ranges
-- Removes stale rules when IPs are no longer in GitHub's list
+- Automatically updates ipset with new IP ranges
+- Removes stale IPs when no longer in GitHub's list
+- Persistent across reboots
 - Comprehensive logging to `/var/log/github-ufw-whitelist.log`
 - Configurable TCP port via environment variable
 - Safe to run multiple times (idempotent)
@@ -19,32 +23,43 @@ This script fetches the current GitHub Actions IP ranges from GitHub's public AP
 
 - Python 3.7 or higher
 - UFW (Uncomplicated Firewall)
+- **ipset** (for efficient IP set management)
+- **iptables-persistent** (recommended, for persistence)
 - Root/sudo access
 - [uv](https://github.com/astral-sh/uv) package manager
 
 ## Installation
 
-### 1. Clone the Repository
+### 1. Install System Dependencies
+
+First, install ipset and iptables-persistent:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y ipset iptables-persistent
+```
+
+### 2. Clone the Repository
 
 ```bash
 cd /opt
-git clone <repository-url> ufw_whitelist
+sudo git clone https://github.com/andrewjcm/ufw_whitelist.git ufw_whitelist
 cd ufw_whitelist
 ```
 
-### 2. Install uv (if not already installed)
+### 3. Install uv (if not already installed)
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
 
-### 3. Install Dependencies
+### 4. Install Python Dependencies
 
 ```bash
 uv sync
 ```
 
-### 4. Configure Environment Variables
+### 5. Configure Environment Variables
 
 ```bash
 cp .env.example .env
@@ -57,14 +72,14 @@ Edit the `.env` file and set your desired TCP port:
 TCP_PORT=22  # Change to your desired port (e.g., 22 for SSH, 443 for HTTPS)
 ```
 
-### 5. Create Log Directory and File
+### 6. Create Log Directory and File
 
 ```bash
 sudo touch /var/log/github-ufw-whitelist.log
 sudo chmod 640 /var/log/github-ufw-whitelist.log
 ```
 
-### 6. Test the Script
+### 7. Test the Script
 
 Run the script manually to ensure it works:
 
@@ -78,10 +93,16 @@ Check the log file for any errors:
 sudo tail -f /var/log/github-ufw-whitelist.log
 ```
 
-Verify UFW rules were added:
+Verify ipset was created and populated:
 
 ```bash
-sudo ufw status numbered | grep "GitHub Actions"
+sudo ipset list github-actions | head -n 20
+```
+
+Verify UFW/iptables rule was added:
+
+```bash
+sudo iptables -L ufw-user-input -n -v | grep github-actions
 ```
 
 ## Crontab Setup
@@ -128,25 +149,37 @@ sudo crontab -l
 
 ## How It Works
 
-1. **Fetch IPs**: The script fetches the latest GitHub Actions IP ranges from `https://api.github.com/meta`
-2. **Compare**: It compares the current IPs with existing UFW rules
-3. **Remove Stale Rules**: Any rules for IPs no longer in GitHub's list are removed
-4. **Add New Rules**: New IPs are added as UFW rules with the comment "GitHub Actions"
-5. **Log**: All actions are logged to `/var/log/github-ufw-whitelist.log`
+The script uses **ipset** for efficient management of thousands of IP addresses:
 
-## UFW Rules Format
+1. **Fetch IPs**: Fetches the latest GitHub Actions IP ranges from `https://api.github.com/meta` (typically 5000+ IPs)
+2. **Create/Update ipset**:
+   - Creates an ipset named `github-actions` if it doesn't exist
+   - Uses batch operations to efficiently add/remove IPs
+3. **Compare & Update**: Compares current IPs with existing ipset entries
+4. **Remove Stale IPs**: Removes IPs no longer in GitHub's list
+5. **Add New IPs**: Adds new IPs using efficient batch method
+6. **Single Firewall Rule**: Creates ONE iptables rule that references the entire ipset
+7. **Persist**: Saves ipset and iptables rules to survive reboots
+8. **Log**: All actions are logged to `/var/log/github-ufw-whitelist.log`
 
-The script creates rules in this format:
+### Why ipset is Fast
 
+Traditional approach: 5000 individual UFW commands = **hours**
+
+ipset approach: Single ipset with batch updates = **seconds**
+
+## Technical Details
+
+The script creates:
+
+1. **ipset** named `github-actions` containing all GitHub Actions IP ranges
+2. **Single iptables rule** that allows traffic from any IP in the ipset:
+
+```bash
+iptables -I ufw-user-input -p tcp --dport <PORT> -m set --match-set github-actions src -j ACCEPT
 ```
-ufw allow from <IP_RANGE> to any port <TCP_PORT> proto tcp comment "GitHub Actions"
-```
 
-Example:
-
-```
-ufw allow from 192.30.252.0/22 to any port 22 proto tcp comment "GitHub Actions"
-```
+This is equivalent to having one rule that matches against 5000+ IPs, but executes in O(1) time.
 
 ## Monitoring
 
@@ -156,10 +189,27 @@ ufw allow from 192.30.252.0/22 to any port 22 proto tcp comment "GitHub Actions"
 sudo tail -f /var/log/github-ufw-whitelist.log
 ```
 
-### Check UFW Rules
+### Check ipset Contents
 
 ```bash
-sudo ufw status numbered | grep "GitHub Actions"
+# List all IPs in the ipset
+sudo ipset list github-actions
+
+# Count total IPs
+sudo ipset list github-actions | grep "Number of entries"
+
+# View first 20 entries
+sudo ipset list github-actions | head -n 30
+```
+
+### Check Firewall Rule
+
+```bash
+# Check iptables rule
+sudo iptables -L ufw-user-input -n -v | grep github-actions
+
+# Check UFW status
+sudo ufw status verbose
 ```
 
 ### Manual Run
@@ -169,6 +219,14 @@ sudo uv run github.py
 ```
 
 ## Troubleshooting
+
+### Script Fails with "ipset is not installed"
+
+Install ipset:
+
+```bash
+sudo apt-get install ipset
+```
 
 ### Script Fails with "Must be run as root"
 
@@ -184,6 +242,44 @@ If UFW is not enabled, enable it first:
 
 ```bash
 sudo ufw enable
+```
+
+### ipset Not Persisting After Reboot
+
+Ensure iptables-persistent is installed and configured:
+
+```bash
+sudo apt-get install iptables-persistent
+sudo netfilter-persistent save
+```
+
+The script also saves ipset to `/etc/ipset/ipset.rules`. To restore on boot, create a systemd service:
+
+```bash
+sudo nano /etc/systemd/system/ipset-restore.service
+```
+
+Add:
+
+```ini
+[Unit]
+Description=Restore ipset rules
+Before=netfilter-persistent.service
+
+[Service]
+Type=oneshot
+ExecStart=/sbin/ipset restore -f /etc/ipset/ipset.rules
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Enable it:
+
+```bash
+sudo systemctl enable ipset-restore.service
+sudo systemctl start ipset-restore.service
 ```
 
 ### Log Permission Issues
@@ -209,6 +305,17 @@ Check syslog for cron execution:
 grep CRON /var/log/syslog
 ```
 
+### Check if IPs are Being Matched
+
+Test if traffic from a specific GitHub Actions IP is allowed:
+
+```bash
+# Check recent connections
+sudo iptables -L ufw-user-input -n -v
+
+# The packet counter should increment when traffic matches
+```
+
 ## Security Considerations
 
 - The `.env` file is excluded from version control (see `.gitignore`)
@@ -219,21 +326,44 @@ grep CRON /var/log/syslog
 
 ## Uninstallation
 
-To remove all GitHub Actions UFW rules:
+To completely remove the GitHub Actions whitelist:
+
+### 1. Remove iptables Rule
 
 ```bash
-# Get rule numbers
-sudo ufw status numbered | grep "GitHub Actions"
+# Find the rule
+sudo iptables -L ufw-user-input --line-numbers | grep github-actions
 
-# Delete each rule (replace X with rule number, starting from highest)
-sudo ufw delete X
+# Delete it (replace X with the line number)
+sudo iptables -D ufw-user-input X
+
+# Save the change
+sudo netfilter-persistent save
 ```
 
-Remove crontab entry:
+### 2. Destroy the ipset
+
+```bash
+sudo ipset destroy github-actions
+```
+
+### 3. Remove Persistent Files
+
+```bash
+sudo rm -f /etc/ipset/ipset.rules
+```
+
+### 4. Remove Crontab Entry
 
 ```bash
 sudo crontab -e
 # Remove the line containing github.py
+```
+
+### 5. Optional: Remove the Project
+
+```bash
+sudo rm -rf /opt/ufw_whitelist
 ```
 
 ## License
