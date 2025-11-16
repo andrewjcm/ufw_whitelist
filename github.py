@@ -3,13 +3,17 @@
 GitHub Actions IP Whitelist Script
 
 This script fetches the current GitHub Actions IP ranges from GitHub's API
-and configures UFW firewall rules to allow access on a specified TCP port.
+and configures UFW firewall rules using ipset for efficient management of
+thousands of IP addresses.
+
+Uses ipset to manage large IP lists efficiently (single rule instead of thousands).
 """
 
 import os
 import sys
 import subprocess
 import logging
+import tempfile
 from datetime import datetime
 from typing import List, Set
 import requests
@@ -29,8 +33,11 @@ logger = logging.getLogger(__name__)
 # GitHub API endpoint for meta information
 GITHUB_META_URL = "https://api.github.com/meta"
 
-# UFW rule comment to identify our managed rules
-UFW_COMMENT = "GitHub Actions"
+# ipset name for GitHub Actions IPs
+IPSET_NAME = "github-actions"
+
+# UFW rule comment to identify our managed rule
+UFW_COMMENT = "GitHub Actions (ipset)"
 
 
 def load_config() -> int:
@@ -81,37 +88,124 @@ def fetch_github_actions_ips() -> List[str]:
         sys.exit(1)
 
 
-def get_existing_rules(port: int) -> Set[str]:
-    """Get existing UFW rules for GitHub Actions on the specified port."""
+def check_ipset_installed():
+    """Check if ipset is installed."""
+    try:
+        subprocess.run(['ipset', '--version'], capture_output=True, check=True)
+        return True
+    except (subprocess.CalledProcessError, FileNotFoundError):
+        logger.error("ipset is not installed. Install it with: apt-get install ipset")
+        sys.exit(1)
+
+
+def ipset_exists() -> bool:
+    """Check if our ipset already exists."""
     try:
         result = subprocess.run(
-            ['ufw', 'status', 'numbered'],
+            ['ipset', 'list', IPSET_NAME],
+            capture_output=True,
+            text=True
+        )
+        return result.returncode == 0
+    except subprocess.CalledProcessError:
+        return False
+
+
+def create_ipset():
+    """Create the ipset for GitHub Actions IPs."""
+    try:
+        logger.info(f"Creating ipset '{IPSET_NAME}'")
+        subprocess.run(
+            ['ipset', 'create', IPSET_NAME, 'hash:net', 'family', 'inet', 'hashsize', '4096', 'maxelem', '10000'],
+            capture_output=True,
+            text=True,
+            check=True
+        )
+        logger.info("ipset created successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to create ipset: {e.stderr}")
+        return False
+
+
+def get_ipset_entries() -> Set[str]:
+    """Get current entries in the ipset."""
+    try:
+        result = subprocess.run(
+            ['ipset', 'list', IPSET_NAME],
             capture_output=True,
             text=True,
             check=True
         )
 
-        existing_ips = set()
+        entries = set()
+        in_members = False
         for line in result.stdout.split('\n'):
-            if UFW_COMMENT in line and str(port) in line:
-                # Extract IP from rule line
-                # Format: [ X] 22/tcp ALLOW IN 192.30.252.0/22 # GitHub Actions
-                parts = line.split()
-                for i, part in enumerate(parts):
-                    if '/' in part and '.' in part:
-                        # Found IP CIDR
-                        existing_ips.add(part)
+            if line.startswith('Members:'):
+                in_members = True
+                continue
+            if in_members and line.strip():
+                entries.add(line.strip())
 
-        return existing_ips
-
+        return entries
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to get UFW status: {e}")
+        logger.error(f"Failed to get ipset entries: {e}")
         return set()
 
 
-def remove_stale_rules(port: int, current_ips: Set[str]):
-    """Remove UFW rules for IPs that are no longer in GitHub's list."""
+def update_ipset(current_ips: List[str]):
+    """Update ipset with current GitHub Actions IPs using efficient batch method."""
+    logger.info(f"Updating ipset with {len(current_ips)} IP ranges")
+
+    # Get existing entries
+    existing_ips = get_ipset_entries()
+    current_ips_set = set(current_ips)
+
+    # Calculate differences
+    to_add = current_ips_set - existing_ips
+    to_remove = existing_ips - current_ips_set
+
+    logger.info(f"IPs to add: {len(to_add)}, IPs to remove: {len(to_remove)}")
+
+    # Remove stale entries
+    if to_remove:
+        for ip in to_remove:
+            try:
+                subprocess.run(
+                    ['ipset', 'del', IPSET_NAME, ip],
+                    capture_output=True,
+                    check=True
+                )
+            except subprocess.CalledProcessError as e:
+                logger.warning(f"Failed to remove {ip}: {e}")
+
+    # Add new entries using restore (batch method - much faster!)
+    if to_add:
+        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
+            for ip in to_add:
+                f.write(f"add {IPSET_NAME} {ip}\n")
+            temp_file = f.name
+
+        try:
+            subprocess.run(
+                ['ipset', 'restore', '-exist'],
+                stdin=open(temp_file, 'r'),
+                capture_output=True,
+                check=True
+            )
+            logger.info(f"Successfully added {len(to_add)} new IP ranges")
+        except subprocess.CalledProcessError as e:
+            logger.error(f"Failed to add IPs to ipset: {e.stderr}")
+        finally:
+            os.unlink(temp_file)
+
+    return True
+
+
+def ensure_ufw_rule_exists(port: int):
+    """Ensure UFW has a rule to allow traffic from our ipset."""
     try:
+        # Check if rule already exists
         result = subprocess.run(
             ['ufw', 'status', 'numbered'],
             capture_output=True,
@@ -119,76 +213,82 @@ def remove_stale_rules(port: int, current_ips: Set[str]):
             check=True
         )
 
-        # Collect rule numbers to delete (in reverse order)
-        rules_to_delete = []
+        # Look for our ipset rule
+        if UFW_COMMENT in result.stdout:
+            logger.info("UFW rule for ipset already exists")
+            return True
 
-        for line in result.stdout.split('\n'):
-            if UFW_COMMENT in line and str(port) in line:
-                # Extract rule number and IP
-                if line.strip().startswith('['):
-                    try:
-                        rule_num = line.split(']')[0].strip('[').strip()
+        # Rule doesn't exist, create it using iptables directly
+        logger.info(f"Creating UFW rule for ipset on port {port}")
 
-                        # Extract IP from the rule
-                        parts = line.split()
-                        ip_found = None
-                        for part in parts:
-                            if '/' in part and '.' in part:
-                                ip_found = part
-                                break
-
-                        if ip_found and ip_found not in current_ips:
-                            rules_to_delete.append((int(rule_num), ip_found))
-
-                    except (IndexError, ValueError):
-                        continue
-
-        # Delete rules in reverse order to maintain rule numbers
-        for rule_num, ip in sorted(rules_to_delete, reverse=True):
-            logger.info(f"Removing stale rule for {ip}")
-            subprocess.run(
-                ['ufw', 'delete', str(rule_num)],
-                input='y\n',
-                capture_output=True,
-                text=True
-            )
-
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to remove stale rules: {e}")
-
-
-def add_ufw_rule(ip_range: str, port: int):
-    """Add a UFW rule to allow traffic from IP range on specified port."""
-    try:
-        cmd = [
-            'ufw', 'allow', 'from', ip_range,
-            'to', 'any', 'port', str(port),
-            'proto', 'tcp', 'comment', UFW_COMMENT
-        ]
-
-        result = subprocess.run(
-            cmd,
+        # Add iptables rule directly (UFW-compatible)
+        # This creates a rule that allows traffic from IPs in the ipset
+        subprocess.run(
+            [
+                'iptables', '-I', 'ufw-user-input', '1',
+                '-p', 'tcp', '--dport', str(port),
+                '-m', 'set', '--match-set', IPSET_NAME, 'src',
+                '-j', 'ACCEPT',
+                '-m', 'comment', '--comment', UFW_COMMENT
+            ],
             capture_output=True,
-            text=True,
             check=True
         )
 
-        logger.info(f"Added rule: {ip_range} -> port {port}/tcp")
+        logger.info("UFW rule created successfully")
         return True
 
     except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to add UFW rule for {ip_range}: {e.stderr}")
+        logger.error(f"Failed to create UFW rule: {e.stderr}")
+        return False
+
+
+def make_ipset_persistent():
+    """Make ipset persistent across reboots."""
+    try:
+        # Save current ipset configuration
+        logger.info("Making ipset persistent")
+
+        # Create directory if it doesn't exist
+        os.makedirs('/etc/ipset', exist_ok=True)
+
+        # Save ipset
+        with open('/etc/ipset/ipset.rules', 'w') as f:
+            result = subprocess.run(
+                ['ipset', 'save'],
+                capture_output=True,
+                text=True,
+                check=True
+            )
+            f.write(result.stdout)
+
+        logger.info("ipset configuration saved to /etc/ipset/ipset.rules")
+
+        # Check if netfilter-persistent is installed
+        try:
+            subprocess.run(['which', 'netfilter-persistent'], capture_output=True, check=True)
+            subprocess.run(['netfilter-persistent', 'save'], capture_output=True, check=True)
+            logger.info("iptables rules saved via netfilter-persistent")
+        except subprocess.CalledProcessError:
+            logger.warning("netfilter-persistent not found. Install with: apt-get install iptables-persistent")
+
+        return True
+    except Exception as e:
+        logger.error(f"Failed to make ipset persistent: {e}")
         return False
 
 
 def main():
     """Main execution function."""
     logger.info("=" * 60)
-    logger.info("GitHub Actions UFW Whitelist Script Starting")
+    logger.info("GitHub Actions UFW Whitelist Script Starting (ipset mode)")
     logger.info("=" * 60)
 
     # Check if running as root
     check_root()
+
+    # Check if ipset is installed
+    check_ipset_installed()
 
     # Load configuration
     tcp_port = load_config()
@@ -196,28 +296,26 @@ def main():
 
     # Fetch GitHub Actions IPs
     github_ips = fetch_github_actions_ips()
-    current_ips = set(github_ips)
+    logger.info(f"Retrieved {len(github_ips)} IP ranges from GitHub")
 
-    # Get existing rules
-    existing_ips = get_existing_rules(tcp_port)
-    logger.info(f"Found {len(existing_ips)} existing rules")
-
-    # Remove stale rules
-    stale_ips = existing_ips - current_ips
-    if stale_ips:
-        logger.info(f"Removing {len(stale_ips)} stale rules")
-        remove_stale_rules(tcp_port, current_ips)
-
-    # Add new rules
-    new_ips = current_ips - existing_ips
-    if new_ips:
-        logger.info(f"Adding {len(new_ips)} new rules")
-        for ip_range in new_ips:
-            add_ufw_rule(ip_range, tcp_port)
+    # Create ipset if it doesn't exist
+    if not ipset_exists():
+        logger.info("ipset does not exist, creating it")
+        create_ipset()
     else:
-        logger.info("No new IPs to add")
+        logger.info(f"ipset '{IPSET_NAME}' already exists")
+
+    # Update ipset with current IPs (efficiently handles adds/removes)
+    update_ipset(github_ips)
+
+    # Ensure UFW has a rule to allow traffic from the ipset
+    ensure_ufw_rule_exists(tcp_port)
+
+    # Make ipset persistent across reboots
+    make_ipset_persistent()
 
     logger.info("Script completed successfully")
+    logger.info(f"Total IP ranges managed: {len(github_ips)}")
     logger.info("=" * 60)
 
 
