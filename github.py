@@ -14,21 +14,34 @@ import sys
 import subprocess
 import logging
 import tempfile
+import ipaddress
 from datetime import datetime
 from typing import List, Set
 import requests
 from dotenv import load_dotenv
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler('/var/log/github-ufw-whitelist.log'),
-        logging.StreamHandler(sys.stdout)
-    ]
-)
+# Logger instance (configured in setup_logging())
 logger = logging.getLogger(__name__)
+
+
+def setup_logging():
+    """Configure logging for the script."""
+    handlers = [logging.StreamHandler(sys.stdout)]
+
+    # Try to add file handler, but don't fail if directory doesn't exist
+    log_file = '/var/log/github-ufw-whitelist.log'
+    try:
+        handlers.append(logging.FileHandler(log_file))
+    except (FileNotFoundError, PermissionError) as e:
+        # Log to console only if file handler fails
+        pass
+
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        handlers=handlers,
+        force=True  # Override any existing configuration
+    )
 
 # GitHub API endpoint for meta information
 GITHUB_META_URL = "https://api.github.com/meta"
@@ -90,17 +103,24 @@ def fetch_github_actions_ips() -> List[str]:
 
 
 def separate_ip_families(ip_list: List[str]) -> tuple[List[str], List[str]]:
-    """Separate IPv4 and IPv6 addresses."""
+    """Separate IPv4 and IPv6 addresses using proper IP parsing."""
     ipv4_list = []
     ipv6_list = []
 
-    for ip in ip_list:
-        if ':' in ip:
-            # IPv6 addresses contain colons
-            ipv6_list.append(ip)
-        else:
-            # IPv4 addresses are dotted decimal
-            ipv4_list.append(ip)
+    for ip_str in ip_list:
+        try:
+            # Parse the IP network (supports both single IPs and CIDR notation)
+            network = ipaddress.ip_network(ip_str, strict=False)
+
+            if network.version == 4:
+                ipv4_list.append(ip_str)
+            elif network.version == 6:
+                ipv6_list.append(ip_str)
+            else:
+                logger.warning(f"Unknown IP version for {ip_str}")
+        except ValueError as e:
+            logger.warning(f"Failed to parse IP address '{ip_str}': {e}")
+            continue
 
     logger.info(f"Separated into {len(ipv4_list)} IPv4 and {len(ipv6_list)} IPv6 ranges")
     return ipv4_list, ipv6_list
@@ -316,6 +336,9 @@ def make_ipset_persistent():
 
 def main():
     """Main execution function."""
+    # Setup logging first
+    setup_logging()
+
     logger.info("=" * 60)
     logger.info("GitHub Actions UFW Whitelist Script Starting (ipset mode)")
     logger.info("=" * 60)

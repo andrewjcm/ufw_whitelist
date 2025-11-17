@@ -218,6 +218,57 @@ sudo ufw status verbose
 sudo uv run github.py
 ```
 
+## Testing
+
+This project includes comprehensive unit tests to ensure reliability.
+
+### Running Tests
+
+Run all tests:
+
+```bash
+uv run pytest
+```
+
+Run tests with verbose output:
+
+```bash
+uv run pytest -v
+```
+
+Run tests with coverage report:
+
+```bash
+uv run pytest --cov=github --cov-report=html
+```
+
+Run specific test class:
+
+```bash
+uv run pytest test_github.py::TestSeparateIPFamilies -v
+```
+
+### Test Structure
+
+The test suite includes:
+
+- **Configuration Tests**: Validate port configuration loading
+- **IP Parsing Tests**: Verify IPv4/IPv6 address separation
+- **API Tests**: Mock GitHub API responses
+- **ipset Tests**: Test ipset creation and management
+- **Firewall Rule Tests**: Validate iptables rule creation
+
+All external dependencies (subprocess calls, API requests) are mocked to ensure tests run quickly and don't require root privileges.
+
+### Writing New Tests
+
+When adding new functionality:
+
+1. Add corresponding tests in `test_github.py`
+2. Mock external dependencies (subprocess, requests, file I/O)
+3. Test both success and failure cases
+4. Run tests before committing: `uv run pytest`
+
 ## Troubleshooting
 
 ### Script Fails with "ipset is not installed"
