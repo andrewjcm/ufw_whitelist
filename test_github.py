@@ -400,43 +400,146 @@ class TestCheckIPSetInstalled:
             github.check_ipset_installed()
 
 
-class TestEnsureUFWRuleExists:
-    """Tests for ensure_ufw_rule_exists function."""
+class TestCheckUFWRulesInConfig:
+    """Tests for check_ufw_rules_in_config function."""
 
-    @patch('github.subprocess.run')
-    def test_create_ipv4_rule(self, mock_run):
-        """Test creating IPv4 iptables rule."""
-        # First call: check if rule exists (not found)
-        # Second call: create the rule
-        mock_result = Mock()
-        mock_result.stdout = ""
-        mock_run.return_value = mock_result
+    @patch('github.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data='# Some UFW rules\n-A ufw-before-input -j ACCEPT\n')
+    def test_rules_not_found(self, mock_file, mock_exists):
+        """Test when GitHub Actions rules are not in config."""
+        mock_exists.return_value = True
 
-        result = github.ensure_ufw_rule_exists(22, 'test-ipset-v4', 4)
+        result = github.check_ufw_rules_in_config('/etc/ufw/before.rules', 'github-actions-v4')
+        assert result is False
+
+    @patch('github.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data='# GitHub Actions ipset rules\n-A ufw-before-input -m set --match-set github-actions-v4 src -j ACCEPT\n')
+    def test_rules_found(self, mock_file, mock_exists):
+        """Test when GitHub Actions rules exist in config."""
+        mock_exists.return_value = True
+
+        result = github.check_ufw_rules_in_config('/etc/ufw/before.rules', 'github-actions-v4')
         assert result is True
 
-    @patch('github.subprocess.run')
-    def test_create_ipv6_rule(self, mock_run):
-        """Test creating IPv6 ip6tables rule."""
-        mock_result = Mock()
-        mock_result.stdout = ""
-        mock_run.return_value = mock_result
+    @patch('github.os.path.exists')
+    def test_config_file_not_exists(self, mock_exists):
+        """Test when config file doesn't exist."""
+        mock_exists.return_value = False
 
-        result = github.ensure_ufw_rule_exists(22, 'test-ipset-v6', 6)
+        result = github.check_ufw_rules_in_config('/etc/ufw/before.rules', 'github-actions-v4')
+        assert result is False
+
+
+class TestAddRulesToUFWConfig:
+    """Tests for add_rules_to_ufw_config function."""
+
+    @patch('github.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data='# Existing rules\n-A ufw-before-input -j ACCEPT\nCOMMIT\n')
+    def test_add_ipv4_rules(self, mock_file, mock_exists):
+        """Test adding IPv4 rules to before.rules."""
+        mock_exists.return_value = True
+
+        result = github.add_rules_to_ufw_config('/etc/ufw/before.rules', 'github-actions-v4', 22)
         assert result is True
-        # Verify ip6tables was called
-        call_args = mock_run.call_args_list
-        assert any('ip6tables' in str(call) for call in call_args)
+
+        # Verify file operations occurred
+        assert mock_file.call_count >= 2  # At least read and write
+
+    @patch('github.os.path.exists')
+    @patch('builtins.open', new_callable=mock_open, read_data='# Existing rules\n-A ufw6-before-input -j ACCEPT\nCOMMIT\n')
+    def test_add_ipv6_rules(self, mock_file, mock_exists):
+        """Test adding IPv6 rules to before6.rules."""
+        mock_exists.return_value = True
+
+        result = github.add_rules_to_ufw_config('/etc/ufw/before6.rules', 'github-actions-v6', 22)
+        assert result is True
+
+    @patch('github.os.path.exists')
+    def test_config_file_not_exists(self, mock_exists):
+        """Test when config file doesn't exist."""
+        mock_exists.return_value = False
+
+        result = github.add_rules_to_ufw_config('/etc/ufw/before.rules', 'github-actions-v4', 22)
+        assert result is False
+
+    @patch('github.os.path.exists')
+    @patch('builtins.open', side_effect=PermissionError())
+    def test_permission_error(self, mock_file, mock_exists):
+        """Test handling permission errors."""
+        mock_exists.return_value = True
+
+        result = github.add_rules_to_ufw_config('/etc/ufw/before.rules', 'github-actions-v4', 22)
+        assert result is False
+
+
+class TestReloadUFW:
+    """Tests for reload_ufw function."""
 
     @patch('github.subprocess.run')
-    def test_rule_already_exists(self, mock_run):
-        """Test when rule already exists."""
-        mock_result = Mock()
-        mock_result.stdout = "match-set test-ipset-v4"
-        mock_run.return_value = mock_result
+    def test_reload_success(self, mock_run):
+        """Test successful UFW reload."""
+        mock_run.return_value = Mock()
 
-        result = github.ensure_ufw_rule_exists(22, 'test-ipset-v4', 4)
+        result = github.reload_ufw()
         assert result is True
+        mock_run.assert_called_once()
+
+    @patch('github.subprocess.run')
+    def test_reload_failure(self, mock_run):
+        """Test failed UFW reload."""
+        mock_run.side_effect = subprocess.CalledProcessError(1, 'ufw')
+
+        result = github.reload_ufw()
+        assert result is False
+
+
+class TestEnsureUFWRuleExistsV2:
+    """Tests for updated ensure_ufw_rule_exists using config files."""
+
+    @patch('github.check_ufw_rules_in_config')
+    def test_rules_already_exist(self, mock_check):
+        """Test when rules already exist in config."""
+        mock_check.return_value = True
+
+        result = github.ensure_ufw_rule_exists(22, 'github-actions-v4', 4)
+        assert result is True
+
+    @patch('github.reload_ufw')
+    @patch('github.add_rules_to_ufw_config')
+    @patch('github.check_ufw_rules_in_config')
+    def test_add_new_rules_ipv4(self, mock_check, mock_add, mock_reload):
+        """Test adding new IPv4 rules."""
+        mock_check.return_value = False
+        mock_add.return_value = True
+        mock_reload.return_value = True
+
+        result = github.ensure_ufw_rule_exists(22, 'github-actions-v4', 4)
+        assert result is True
+        mock_add.assert_called_with('/etc/ufw/before.rules', 'github-actions-v4', 22)
+        mock_reload.assert_called_once()
+
+    @patch('github.reload_ufw')
+    @patch('github.add_rules_to_ufw_config')
+    @patch('github.check_ufw_rules_in_config')
+    def test_add_new_rules_ipv6(self, mock_check, mock_add, mock_reload):
+        """Test adding new IPv6 rules."""
+        mock_check.return_value = False
+        mock_add.return_value = True
+        mock_reload.return_value = True
+
+        result = github.ensure_ufw_rule_exists(22, 'github-actions-v6', 6)
+        assert result is True
+        mock_add.assert_called_with('/etc/ufw/before6.rules', 'github-actions-v6', 22)
+
+    @patch('github.add_rules_to_ufw_config')
+    @patch('github.check_ufw_rules_in_config')
+    def test_add_rules_fails(self, mock_check, mock_add):
+        """Test when adding rules fails."""
+        mock_check.return_value = False
+        mock_add.return_value = False
+
+        result = github.ensure_ufw_rule_exists(22, 'github-actions-v4', 4)
+        assert result is False
 
 
 if __name__ == '__main__':
