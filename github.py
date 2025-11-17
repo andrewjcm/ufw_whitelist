@@ -249,54 +249,154 @@ def update_ipset(ipset_name: str, current_ips: List[str]):
     return True
 
 
+def check_ufw_rules_in_config(config_file: str, ipset_name: str) -> bool:
+    """Check if our ipset rules exist in UFW config file.
+
+    Args:
+        config_file: Path to UFW config file (before.rules or before6.rules)
+        ipset_name: Name of the ipset to check for
+
+    Returns:
+        True if rules exist, False otherwise
+    """
+    if not os.path.exists(config_file):
+        logger.warning(f"UFW config file not found: {config_file}")
+        return False
+
+    try:
+        with open(config_file, 'r') as f:
+            content = f.read()
+            # Check if our ipset is referenced in the file
+            return ipset_name in content and 'GitHub Actions ipset rules' in content
+    except Exception as e:
+        logger.error(f"Failed to read UFW config file {config_file}: {e}")
+        return False
+
+
+def add_rules_to_ufw_config(config_file: str, ipset_name: str, port: int) -> bool:
+    """Add ipset rules to UFW config file.
+
+    Args:
+        config_file: Path to UFW config file (before.rules or before6.rules)
+        ipset_name: Name of the ipset
+        port: TCP port to allow
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if not os.path.exists(config_file):
+        logger.error(f"UFW config file not found: {config_file}")
+        return False
+
+    try:
+        # Read existing config
+        with open(config_file, 'r') as f:
+            lines = f.readlines()
+
+        # Find the right place to insert our rules (before COMMIT line)
+        insert_index = None
+        for i, line in enumerate(lines):
+            if line.strip() == 'COMMIT':
+                insert_index = i
+                break
+
+        if insert_index is None:
+            logger.error(f"Could not find COMMIT line in {config_file}")
+            return False
+
+        # Determine the chain name based on file
+        if 'before6.rules' in config_file:
+            chain = 'ufw6-before-input'
+        else:
+            chain = 'ufw-before-input'
+
+        # Create our rule lines
+        rule_lines = [
+            '\n',
+            '# GitHub Actions ipset rules - managed by github.py script\n',
+            f'-A {chain} -p tcp --dport {port} -m set --match-set {ipset_name} src -j ACCEPT\n',
+            '# End GitHub Actions ipset rules\n',
+            '\n'
+        ]
+
+        # Insert rules before COMMIT
+        lines[insert_index:insert_index] = rule_lines
+
+        # Write back to file
+        with open(config_file, 'w') as f:
+            f.writelines(lines)
+
+        logger.info(f"Added ipset rules to {config_file}")
+        return True
+
+    except PermissionError:
+        logger.error(f"Permission denied writing to {config_file}. Must run as root.")
+        return False
+    except Exception as e:
+        logger.error(f"Failed to add rules to {config_file}: {e}")
+        return False
+
+
+def reload_ufw() -> bool:
+    """Reload UFW to apply configuration changes.
+
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        logger.info("Reloading UFW to apply changes")
+        subprocess.run(
+            ['ufw', 'reload'],
+            capture_output=True,
+            check=True
+        )
+        logger.info("UFW reloaded successfully")
+        return True
+    except subprocess.CalledProcessError as e:
+        logger.error(f"Failed to reload UFW: {e.stderr}")
+        return False
+
+
 def ensure_ufw_rule_exists(port: int, ipset_name: str, ip_version: int):
     """Ensure UFW has a rule to allow traffic from our ipset.
+
+    Uses UFW's before.rules files instead of direct iptables commands
+    for compatibility with both iptables and nftables backends.
 
     Args:
         port: TCP port to allow
         ipset_name: Name of the ipset
         ip_version: 4 for IPv4, 6 for IPv6
+
+    Returns:
+        True if successful, False otherwise
     """
-    try:
-        iptables_cmd = 'iptables' if ip_version == 4 else 'ip6tables'
-        rule_comment = f"{UFW_COMMENT} IPv{ip_version}"
+    # Determine which config file to use
+    if ip_version == 4:
+        config_file = '/etc/ufw/before.rules'
+    elif ip_version == 6:
+        config_file = '/etc/ufw/before6.rules'
+    else:
+        logger.error(f"Invalid IP version: {ip_version}")
+        return False
 
-        # Check if rule already exists
-        result = subprocess.run(
-            [iptables_cmd, '-L', 'ufw-user-input', '-n'],
-            capture_output=True,
-            text=True,
-            check=True
-        )
-
-        # Look for our ipset rule
-        if ipset_name in result.stdout:
-            logger.info(f"IPv{ip_version} rule for ipset '{ipset_name}' already exists")
-            return True
-
-        # Rule doesn't exist, create it using iptables directly
-        logger.info(f"Creating IPv{ip_version} rule for ipset '{ipset_name}' on port {port}")
-
-        # Add iptables rule directly (UFW-compatible)
-        # This creates a rule that allows traffic from IPs in the ipset
-        subprocess.run(
-            [
-                iptables_cmd, '-I', 'ufw-user-input', '1',
-                '-p', 'tcp', '--dport', str(port),
-                '-m', 'set', '--match-set', ipset_name, 'src',
-                '-j', 'ACCEPT',
-                '-m', 'comment', '--comment', rule_comment
-            ],
-            capture_output=True,
-            check=True
-        )
-
-        logger.info(f"IPv{ip_version} rule created successfully")
+    # Check if rules already exist
+    if check_ufw_rules_in_config(config_file, ipset_name):
+        logger.info(f"IPv{ip_version} rules for '{ipset_name}' already exist in {config_file}")
         return True
 
-    except subprocess.CalledProcessError as e:
-        logger.error(f"Failed to create IPv{ip_version} rule: {e.stderr}")
+    # Add rules to config file
+    logger.info(f"Adding IPv{ip_version} rules for '{ipset_name}' to {config_file}")
+    if not add_rules_to_ufw_config(config_file, ipset_name, port):
         return False
+
+    # Reload UFW to apply changes
+    if not reload_ufw():
+        logger.warning("Failed to reload UFW, changes may not be active")
+        return False
+
+    logger.info(f"IPv{ip_version} rules added successfully")
+    return True
 
 
 def make_ipset_persistent():
