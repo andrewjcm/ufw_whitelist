@@ -50,6 +50,11 @@ GITHUB_META_URL = "https://api.github.com/meta"
 IPSET_NAME_V4 = "github-actions-v4"
 IPSET_NAME_V6 = "github-actions-v6"
 
+# ipset maxelem ceilings. GitHub's actions list grew past the 65536 default
+# in 2026 — bump well above current size to give years of headroom.
+MAXELEM_V4 = 200000
+MAXELEM_V6 = 16384
+
 # UFW rule comment to identify our managed rules
 UFW_COMMENT = "GitHub Actions (ipset)"
 
@@ -149,17 +154,19 @@ def ipset_exists(ipset_name: str) -> bool:
         return False
 
 
-def create_ipset(ipset_name: str, family: str):
+def create_ipset(ipset_name: str, family: str, maxelem: int = 65536):
     """Create an ipset for GitHub Actions IPs.
 
     Args:
         ipset_name: Name of the ipset to create
         family: 'inet' for IPv4 or 'inet6' for IPv6
+        maxelem: Maximum number of elements the set can hold
     """
     try:
-        logger.info(f"Creating ipset '{ipset_name}' (family: {family})")
+        logger.info(f"Creating ipset '{ipset_name}' (family: {family}, maxelem: {maxelem})")
         subprocess.run(
-            ['ipset', 'create', ipset_name, 'hash:net', 'family', family, 'hashsize', '4096', 'maxelem', '10000'],
+            ['ipset', 'create', ipset_name, 'hash:net',
+             'family', family, 'hashsize', '4096', 'maxelem', str(maxelem)],
             capture_output=True,
             text=True,
             check=True
@@ -196,57 +203,62 @@ def get_ipset_entries(ipset_name: str) -> Set[str]:
         return set()
 
 
-def update_ipset(ipset_name: str, current_ips: List[str]):
-    """Update ipset with current GitHub Actions IPs using efficient batch method."""
+def update_ipset(ipset_name: str, family: str, maxelem: int, current_ips: List[str]) -> bool:
+    """Atomically rebuild an ipset using the build-temp-then-swap pattern.
+
+    Creates a fresh temporary set, bulk-loads it via `ipset restore`, then
+    atomically swaps it with the live set so the iptables rule referencing
+    `ipset_name` seamlessly points at the new contents. The old data — now
+    sitting under the temp name — is then destroyed.
+
+    Args:
+        ipset_name: Name of the live ipset (must already exist).
+        family: 'inet' for IPv4 or 'inet6' for IPv6.
+        maxelem: Maximum number of elements for the new set.
+        current_ips: Full list of CIDR ranges the set should contain.
+    """
     if not current_ips:
         logger.info(f"No IPs to update for {ipset_name}")
         return True
 
-    logger.info(f"Updating ipset '{ipset_name}' with {len(current_ips)} IP ranges")
+    tmp_name = f"{ipset_name}-tmp"
+    logger.info(f"Rebuilding ipset '{ipset_name}' with {len(current_ips)} ranges (via {tmp_name})")
 
-    # Get existing entries
-    existing_ips = get_ipset_entries(ipset_name)
-    current_ips_set = set(current_ips)
+    # Best-effort cleanup of any leftover temp from a prior failed run.
+    subprocess.run(['ipset', 'destroy', tmp_name], capture_output=True)
 
-    # Calculate differences
-    to_add = current_ips_set - existing_ips
-    to_remove = existing_ips - current_ips_set
+    try:
+        subprocess.run(
+            ['ipset', 'create', tmp_name, 'hash:net',
+             'family', family, 'hashsize', '4096', 'maxelem', str(maxelem)],
+            capture_output=True, text=True, check=True,
+        )
 
-    logger.info(f"[{ipset_name}] IPs to add: {len(to_add)}, IPs to remove: {len(to_remove)}")
+        payload = "".join(f"add {tmp_name} {ip}\n" for ip in current_ips)
+        subprocess.run(
+            ['ipset', 'restore', '-exist'],
+            input=payload, capture_output=True, text=True, check=True,
+        )
 
-    # Remove stale entries
-    if to_remove:
-        for ip in to_remove:
-            try:
-                subprocess.run(
-                    ['ipset', 'del', ipset_name, ip],
-                    capture_output=True,
-                    check=True
-                )
-            except subprocess.CalledProcessError as e:
-                logger.warning(f"Failed to remove {ip} from {ipset_name}: {e}")
+        subprocess.run(
+            ['ipset', 'swap', ipset_name, tmp_name],
+            capture_output=True, text=True, check=True,
+        )
 
-    # Add new entries using restore (batch method - much faster!)
-    if to_add:
-        with tempfile.NamedTemporaryFile(mode='w', delete=False) as f:
-            for ip in to_add:
-                f.write(f"add {ipset_name} {ip}\n")
-            temp_file = f.name
+        # Post-swap, tmp_name holds the *old* contents — safe to destroy.
+        subprocess.run(
+            ['ipset', 'destroy', tmp_name],
+            capture_output=True, text=True, check=True,
+        )
 
-        try:
-            subprocess.run(
-                ['ipset', 'restore', '-exist'],
-                stdin=open(temp_file, 'r'),
-                capture_output=True,
-                check=True
-            )
-            logger.info(f"[{ipset_name}] Successfully added {len(to_add)} new IP ranges")
-        except subprocess.CalledProcessError as e:
-            logger.error(f"Failed to add IPs to ipset '{ipset_name}': {e.stderr}")
-        finally:
-            os.unlink(temp_file)
+        logger.info(f"[{ipset_name}] Successfully loaded {len(current_ips)} ranges")
+        return True
 
-    return True
+    except subprocess.CalledProcessError as e:
+        stderr = e.stderr.decode() if isinstance(e.stderr, bytes) else (e.stderr or '')
+        logger.error(f"Failed to rebuild ipset '{ipset_name}': {stderr}")
+        subprocess.run(['ipset', 'destroy', tmp_name], capture_output=True)
+        return False
 
 
 def check_ufw_rules_in_config(config_file: str, ipset_name: str) -> bool:
@@ -460,16 +472,21 @@ def main():
     # Separate IPv4 and IPv6 addresses
     ipv4_ips, ipv6_ips = separate_ip_families(github_ips)
 
+    errors: List[str] = []
+
     # Handle IPv4 addresses
     if ipv4_ips:
         if not ipset_exists(IPSET_NAME_V4):
             logger.info(f"IPv4 ipset does not exist, creating it")
-            create_ipset(IPSET_NAME_V4, 'inet')
+            if not create_ipset(IPSET_NAME_V4, 'inet', MAXELEM_V4):
+                errors.append(f"create ipset {IPSET_NAME_V4}")
         else:
             logger.info(f"IPv4 ipset '{IPSET_NAME_V4}' already exists")
 
-        update_ipset(IPSET_NAME_V4, ipv4_ips)
-        ensure_ufw_rule_exists(tcp_port, IPSET_NAME_V4, 4)
+        if not update_ipset(IPSET_NAME_V4, 'inet', MAXELEM_V4, ipv4_ips):
+            errors.append(f"update ipset {IPSET_NAME_V4}")
+        if not ensure_ufw_rule_exists(tcp_port, IPSET_NAME_V4, 4):
+            errors.append(f"ensure UFW rule for {IPSET_NAME_V4}")
     else:
         logger.info("No IPv4 addresses to manage")
 
@@ -477,17 +494,26 @@ def main():
     if ipv6_ips:
         if not ipset_exists(IPSET_NAME_V6):
             logger.info(f"IPv6 ipset does not exist, creating it")
-            create_ipset(IPSET_NAME_V6, 'inet6')
+            if not create_ipset(IPSET_NAME_V6, 'inet6', MAXELEM_V6):
+                errors.append(f"create ipset {IPSET_NAME_V6}")
         else:
             logger.info(f"IPv6 ipset '{IPSET_NAME_V6}' already exists")
 
-        update_ipset(IPSET_NAME_V6, ipv6_ips)
-        ensure_ufw_rule_exists(tcp_port, IPSET_NAME_V6, 6)
+        if not update_ipset(IPSET_NAME_V6, 'inet6', MAXELEM_V6, ipv6_ips):
+            errors.append(f"update ipset {IPSET_NAME_V6}")
+        if not ensure_ufw_rule_exists(tcp_port, IPSET_NAME_V6, 6):
+            errors.append(f"ensure UFW rule for {IPSET_NAME_V6}")
     else:
         logger.info("No IPv6 addresses to manage")
 
     # Make ipset persistent across reboots
-    make_ipset_persistent()
+    if not make_ipset_persistent():
+        errors.append("persist ipset configuration")
+
+    if errors:
+        logger.error(f"Script completed with {len(errors)} error(s): {'; '.join(errors)}")
+        logger.info("=" * 60)
+        sys.exit(1)
 
     logger.info("Script completed successfully")
     logger.info(f"Total IP ranges managed: {len(github_ips)} (IPv4: {len(ipv4_ips)}, IPv6: {len(ipv6_ips)})")

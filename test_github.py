@@ -314,70 +314,88 @@ Members:
 
 
 class TestUpdateIPSet:
-    """Tests for update_ipset function."""
+    """Tests for update_ipset function (swap-pattern rebuild)."""
 
-    @patch('github.os.unlink')
-    @patch('github.open', new_callable=mock_open)
-    @patch('github.get_ipset_entries')
     @patch('github.subprocess.run')
-    @patch('github.tempfile.NamedTemporaryFile')
-    def test_update_ipset_add_new(self, mock_tempfile, mock_run, mock_get_entries, mock_open_file, mock_unlink):
-        """Test adding new IPs to ipset."""
-        # Mock existing entries (empty)
-        mock_get_entries.return_value = set()
-
-        # Mock temporary file
-        mock_file = MagicMock()
-        mock_file.name = '/tmp/test_file'
-        mock_file.__enter__.return_value = mock_file
-        mock_file.__exit__.return_value = None
-        mock_file.write = MagicMock()
-        mock_tempfile.return_value.__enter__.return_value = mock_file
-
-        # Mock subprocess
+    def test_update_ipset_success(self, mock_run):
+        """All ipset commands succeed → returns True and issues create/restore/swap/destroy."""
         mock_run.return_value = Mock()
 
         current_ips = ['192.168.1.0/24', '10.0.0.0/8']
-        result = github.update_ipset('test-ipset', current_ips)
+        result = github.update_ipset('test-ipset', 'inet', 200000, current_ips)
 
         assert result is True
-        # Verify batch restore was called
-        assert mock_run.call_count >= 1
-        # Verify temp file was deleted
-        mock_unlink.assert_called_once()
+        # Expected calls: pre-cleanup destroy, create tmp, restore, swap, destroy tmp = 5
+        assert mock_run.call_count == 5
+        commands = [call.args[0] for call in mock_run.call_args_list]
+        assert commands[0][:2] == ['ipset', 'destroy']           # pre-cleanup
+        assert commands[1][:3] == ['ipset', 'create', 'test-ipset-tmp']
+        assert commands[2][:2] == ['ipset', 'restore']
+        assert commands[3][:2] == ['ipset', 'swap']
+        assert commands[4][:3] == ['ipset', 'destroy', 'test-ipset-tmp']
 
-    @patch('github.get_ipset_entries')
     @patch('github.subprocess.run')
-    def test_update_ipset_remove_stale(self, mock_run, mock_get_entries):
-        """Test removing stale IPs from ipset."""
-        # Mock existing entries
-        mock_get_entries.return_value = {'192.168.1.0/24', '10.0.0.0/8', '172.16.0.0/12'}
+    def test_update_ipset_restore_payload_contains_all_ips(self, mock_run):
+        """The restore step should receive `add <tmp> <ip>` lines for every IP."""
+        mock_run.return_value = Mock()
+        ips = ['192.168.1.0/24', '10.0.0.0/8', '172.16.0.0/12']
 
-        # Current IPs (missing 172.16.0.0/12)
-        current_ips = ['192.168.1.0/24', '10.0.0.0/8']
-        result = github.update_ipset('test-ipset', current_ips)
+        github.update_ipset('test-ipset', 'inet', 200000, ips)
 
-        assert result is True
+        restore_call = mock_run.call_args_list[2]
+        payload = restore_call.kwargs['input']
+        for ip in ips:
+            assert f"add test-ipset-tmp {ip}\n" in payload
 
-    @patch('github.get_ipset_entries')
-    def test_update_ipset_empty_list(self, mock_get_entries):
-        """Test updating with empty IP list."""
-        mock_get_entries.return_value = set()
-
-        result = github.update_ipset('test-ipset', [])
-        assert result is True
-
-    @patch('github.get_ipset_entries')
     @patch('github.subprocess.run')
-    def test_update_ipset_no_changes(self, mock_run, mock_get_entries):
-        """Test updating when IPs are already current."""
-        existing = {'192.168.1.0/24', '10.0.0.0/8'}
-        mock_get_entries.return_value = existing
+    def test_update_ipset_uses_correct_family_and_maxelem(self, mock_run):
+        """create-tmp should be invoked with the given family and maxelem."""
+        mock_run.return_value = Mock()
 
-        current_ips = ['192.168.1.0/24', '10.0.0.0/8']
-        result = github.update_ipset('test-ipset', current_ips)
+        github.update_ipset('test-ipset-v6', 'inet6', 16384, ['2001:db8::/32'])
 
+        create_call = mock_run.call_args_list[1].args[0]
+        assert 'inet6' in create_call
+        assert '16384' in create_call
+
+    @patch('github.subprocess.run')
+    def test_update_ipset_empty_list(self, mock_run):
+        """Empty IP list → short-circuit, no subprocess calls."""
+        result = github.update_ipset('test-ipset', 'inet', 200000, [])
         assert result is True
+        mock_run.assert_not_called()
+
+    @patch('github.subprocess.run')
+    def test_update_ipset_create_failure_returns_false(self, mock_run):
+        """If creating the tmp set fails, returns False and cleans up tmp."""
+        # 1st call: pre-cleanup destroy (succeeds, no check)
+        # 2nd call: create tmp → raises
+        # 3rd call: except-block cleanup destroy
+        mock_run.side_effect = [
+            Mock(),
+            subprocess.CalledProcessError(1, 'ipset', stderr=b'Hash is full'),
+            Mock(),
+        ]
+
+        result = github.update_ipset('test-ipset', 'inet', 200000, ['192.168.1.0/24'])
+
+        assert result is False
+        assert mock_run.call_count == 3
+
+    @patch('github.subprocess.run')
+    def test_update_ipset_swap_failure_returns_false(self, mock_run):
+        """Failure during swap returns False; tmp set is destroyed in cleanup."""
+        mock_run.side_effect = [
+            Mock(),  # pre-cleanup destroy
+            Mock(),  # create tmp
+            Mock(),  # restore
+            subprocess.CalledProcessError(1, 'ipset', stderr=b'swap failed'),  # swap
+            Mock(),  # except-block cleanup destroy
+        ]
+
+        result = github.update_ipset('test-ipset', 'inet', 200000, ['192.168.1.0/24'])
+        assert result is False
+        assert mock_run.call_count == 5
 
 
 class TestCheckIPSetInstalled:
